@@ -1,182 +1,132 @@
-import { FormEvent, useMemo, useState } from "react";
+import { useMemo, useState } from "react";
+import {
+  DndContext,
+  DragOverlay,
+  KeyboardSensor,
+  PointerSensor,
+  closestCenter,
+  useSensor,
+  useSensors,
+  type DragEndEvent,
+  type DragStartEvent,
+} from "@dnd-kit/core";
+import { sortableKeyboardCoordinates } from "@dnd-kit/sortable";
+import { App as AntdApp, Button, Popconfirm } from "antd";
+import type { Order } from "./types";
+import { useScheduleStore } from "./store/scheduleStore";
+import { violationText } from "./lib/violationText";
+import { OrderCardView } from "./components/OrderCard";
+import { PendingPool } from "./components/PendingPool";
+import { ShiftColumn } from "./components/ShiftColumn";
+import { BlockPanel } from "./components/BlockPanel";
+import { HandoverLog } from "./components/HandoverLog";
+import { NewOrderModal } from "./components/NewOrderModal";
+import { HandoverModal } from "./components/HandoverModal";
 
-type Field = {
-  key: string;
-  label: string;
-  type?: "number" | "date" | "select";
-  options?: string[];
-};
+function Board() {
+  const { message } = AntdApp.useApp();
+  const store = useScheduleStore();
+  const { drivers, shifts, orders, blocks, handovers } = store;
 
-type RecordItem = {
-  id: string;
-  status: string;
-  notes: string;
-  createdAt: string;
-  [key: string]: string | number;
-};
+  const [activeId, setActiveId] = useState<string | null>(null);
+  const [newOpen, setNewOpen] = useState(false);
+  const [handoverOrderId, setHandoverOrderId] = useState<string | null>(null);
+  const [presetShiftId, setPresetShiftId] = useState<string | undefined>(undefined);
 
-const project = {
-  "number": 14,
-  "folder": "hxwl/frontend/hxwlfront-14",
-  "framework": "react",
-  "title": "配送任务拖拽排班",
-  "subtitle": "把待分配订单安排给司机，并统计任务数和总重量。",
-  "industry": "物流",
-  "stack": [
-    "React",
-    "Vite",
-    "TypeScript",
-    "Ant Design",
-    "dnd-kit"
-  ],
-  "storageKey": "hxwlfront-14-schedule",
-  "formTitle": "新增待分配订单",
-  "primaryAction": "加入待分配",
-  "entityLabel": "订单",
-  "statuses": [
-    "待分配",
-    "已分配",
-    "已完成"
-  ],
-  "filters": [
-    "全部司机",
-    "刘师傅",
-    "赵师傅",
-    "孙师傅"
-  ],
-  "fields": [
-    {
-      "key": "orderNo",
-      "label": "订单号"
-    },
-    {
-      "key": "driver",
-      "label": "司机",
-      "type": "select",
-      "options": [
-        "刘师傅",
-        "赵师傅",
-        "孙师傅"
-      ]
-    },
-    {
-      "key": "weight",
-      "label": "重量kg",
-      "type": "number"
-    },
-    {
-      "key": "destination",
-      "label": "目的地"
+  const sensors = useSensors(
+    useSensor(PointerSensor, { activationConstraint: { distance: 6 } }),
+    useSensor(KeyboardSensor, { coordinateGetter: sortableKeyboardCoordinates })
+  );
+
+  const driverName = useMemo(() => {
+    const map = new Map(drivers.map((d) => [d.id, d.name]));
+    return (id: string) => map.get(id) ?? "未知司机";
+  }, [drivers]);
+
+  const stats = useMemo(() => {
+    const count = (s: Order["status"]) => orders.filter((o) => o.status === s).length;
+    return [
+      { label: "待分配", value: count("pending") },
+      { label: "已排班", value: count("scheduled") },
+      { label: "待放行", value: count("hold"), warn: true },
+      { label: "已发车", value: count("departed") },
+      { label: "受阻未处理", value: blocks.filter((b) => !b.resolved).length, warn: true },
+    ];
+  }, [orders, blocks]);
+
+  const activeOrder = activeId ? orders.find((o) => o.id === activeId) ?? null : null;
+  const handoverOrder = handoverOrderId ? orders.find((o) => o.id === handoverOrderId) ?? null : null;
+
+  function onDragStart(event: DragStartEvent) {
+    setActiveId(String(event.active.id));
+  }
+
+  function onDragEnd(event: DragEndEvent) {
+    setActiveId(null);
+    const { active, over } = event;
+    if (!over) return;
+
+    const orderId = String(active.id);
+    const order = orders.find((o) => o.id === orderId);
+    if (!order) return;
+
+    const kind = over.data.current?.kind as string | undefined;
+
+    if (kind === "pool") {
+      if (order.status === "departed") {
+        message.info("已发车订单不能拖回，请用「交接下一班」");
+        return;
+      }
+      if (order.status === "pending") return;
+      store.returnToPool(orderId);
+      message.success(`已撤回 ${order.no}`);
+      return;
     }
-  ],
-  "records": [
-    {
-      "orderNo": "ORD-9012",
-      "driver": "刘师傅",
-      "weight": 260,
-      "destination": "浦东",
-      "status": "已分配",
-      "notes": "上午配送"
-    },
-    {
-      "orderNo": "ORD-9031",
-      "driver": "赵师傅",
-      "weight": 140,
-      "destination": "嘉定",
-      "status": "待分配",
-      "notes": "待排班"
+
+    if (kind === "shift") {
+      const shiftId = String(over.data.current?.shiftId);
+
+      if (order.status === "departed") {
+        if (shiftId === order.shiftId) {
+          message.info("已发车订单不能拖回原司机班，请交接给其他班次");
+          return;
+        }
+        // 交接需要原因，弹窗收集后执行
+        setHandoverOrderId(orderId);
+        setPresetShiftId(shiftId);
+        return;
+      }
+
+      const result = store.assignOrder(orderId, shiftId);
+      const shift = shifts.find((s) => s.id === shiftId);
+      const target = shift ? `${shift.name}·${driverName(shift.driverId)}` : "目标班次";
+      if (result.ok) {
+        message.success(`${order.no} 已排到 ${target}`);
+      } else if (result.held) {
+        message.warning(`${order.no} 已挂到 ${target}「待放行」：${result.violations.map(violationText).join("；")}`);
+      } else {
+        message.error(
+          result.bounced
+            ? `${order.no} 无法排到 ${target}，已留在待分配：${result.violations.map(violationText).join("；")}`
+            : `${order.no} 无法改排到 ${target}，保留原班次：${result.violations.map(violationText).join("；")}`
+        );
+      }
     }
-  ],
-  "metricLabels": [
-    "订单数",
-    "已分配",
-    "总重量"
-  ]
-} as const;
-
-const fields = project.fields as unknown as Field[];
-const statuses: string[] = [...project.statuses];
-
-function createBlank() {
-  return Object.fromEntries(fields.map((field) => [field.key, field.type === "number" ? 0 : ""]));
-}
-
-function loadRecords(): RecordItem[] {
-  const raw = localStorage.getItem(project.storageKey);
-  if (!raw) {
-    return project.records.map((record, index) => ({
-      ...record,
-      id: `seed-${index + 1}`,
-      createdAt: new Date(Date.now() - index * 86400000).toISOString()
-    })) as RecordItem[];
-  }
-  try {
-    return JSON.parse(raw) as RecordItem[];
-  } catch {
-    return [];
-  }
-}
-
-function saveRecords(records: RecordItem[]) {
-  localStorage.setItem(project.storageKey, JSON.stringify(records));
-}
-
-function nextStatus(status: string) {
-  const index = statuses.indexOf(status);
-  return statuses[(index + 1) % statuses.length];
-}
-
-function primaryText(record: RecordItem) {
-  const first = fields[0];
-  const second = fields[1];
-  return [record[first.key], record[second.key]].filter(Boolean).join(" / ") || project.entityLabel;
-}
-
-export default function App() {
-  const [records, setRecords] = useState<RecordItem[]>(loadRecords);
-  const [form, setForm] = useState<Record<string, string | number>>(createBlank);
-  const [note, setNote] = useState("");
-  const [filter, setFilter] = useState<string>(project.filters[0]);
-
-  const filteredRecords = useMemo(() => {
-    if (filter.startsWith("全部")) return records;
-    return records.filter((record) => Object.values(record).includes(filter));
-  }, [filter, records]);
-
-  const metrics = useMemo(() => {
-    const total = records.length;
-    const second = records.filter((record) => record.status === statuses[1]).length;
-    const third = records.filter((record) => record.status === statuses[2]).length;
-    const numberValues = records.flatMap((record) =>
-      fields.filter((field) => field.type === "number").map((field) => Number(record[field.key] || 0))
-    );
-    const sum = numberValues.reduce((acc, value) => acc + value, 0);
-    return [total, second || sum, third || Math.round(sum / Math.max(total, 1))];
-  }, [records]);
-
-  const chartRows = statuses.map((status) => ({
-    status,
-    value: records.filter((record) => record.status === status).length
-  }));
-  const maxChart = Math.max(1, ...chartRows.map((row) => row.value));
-
-  function updateRecords(next: RecordItem[]) {
-    setRecords(next);
-    saveRecords(next);
   }
 
-  function handleSubmit(event: FormEvent<HTMLFormElement>) {
-    event.preventDefault();
-    const next: RecordItem = {
-      ...form,
-      id: crypto.randomUUID(),
-      status: statuses[0],
-      notes: note || "暂无备注",
-      createdAt: new Date().toISOString()
-    } as RecordItem;
-    updateRecords([next, ...records]);
-    setForm(createBlank());
-    setNote("");
+  function confirmHandover(toShiftId: string, reason: string) {
+    if (!handoverOrderId) return;
+    const result = store.handover(handoverOrderId, toShiftId, reason);
+    const order = orders.find((o) => o.id === handoverOrderId);
+    const shift = shifts.find((s) => s.id === toShiftId);
+    const target = shift ? `${shift.name}·${driverName(shift.driverId)}` : "目标班次";
+    if (result.ok) {
+      message.success(`${order?.no ?? "订单"} 已交接给 ${target}，原班容量已释放`);
+      setHandoverOrderId(null);
+      setPresetShiftId(undefined);
+    } else {
+      message.error(`交接受阻，${order?.no ?? "订单"} 留在原班：${result.violations.map(violationText).join("；")}`);
+    }
   }
 
   return (
@@ -184,106 +134,102 @@ export default function App() {
       <div className="shell">
         <header className="topbar">
           <div>
-            <p className="eyebrow">{project.industry}行业前端最小闭环</p>
-            <h1>{project.title}</h1>
-            <p className="subtitle">{project.subtitle}</p>
+            <p className="eyebrow">物流配送 · 拖拽式班次排班台</p>
+            <h1>班次板排班台</h1>
+            <p className="subtitle">
+              待分配订单按取货时段拖给司机班次：重叠时段同一班次只能接一单；冷链订单仅保温箱司机可接；
+              单班总重或总时长超限先进「待放行」；已发车订单可交接下一班并当场释放原班容量。
+            </p>
           </div>
-          <div className="stack">{project.stack.map((item) => <span className="tag" key={item}>{item}</span>)}</div>
+          <div className="top-actions">
+            <Button type="primary" size="large" onClick={() => setNewOpen(true)}>＋ 新增订单</Button>
+            <Popconfirm
+              title="重置为演示数据？"
+              description="当前排班、受阻与交接记录将被清空。"
+              okText="重置"
+              cancelText="取消"
+              onConfirm={() => { store.resetAll(); message.success("已重置演示数据"); }}
+            >
+              <Button size="large">重置数据</Button>
+            </Popconfirm>
+          </div>
         </header>
 
         <section className="metrics">
-          {project.metricLabels.map((label, index) => (
-            <article className="metric" key={label}>
-              <span>{label}</span>
-              <strong>{metrics[index]}</strong>
+          {stats.map((s) => (
+            <article className={`metric${s.warn && s.value > 0 ? " metric-warn" : ""}`} key={s.label}>
+              <span>{s.label}</span>
+              <strong>{s.value}</strong>
             </article>
           ))}
         </section>
 
-        <section className="workspace">
-          <form className="panel" onSubmit={handleSubmit}>
-            <h2>{project.formTitle}</h2>
-            <div className="form-grid">
-              {fields.map((field) => (
-                <label key={field.key}>
-                  {field.label}
-                  {field.type === "select" ? (
-                    <select
-                      value={String(form[field.key])}
-                      onChange={(event) => setForm({ ...form, [field.key]: event.target.value })}
-                      required
-                    >
-                      <option value="">请选择</option>
-                      {field.options?.map((option) => <option key={option}>{option}</option>)}
-                    </select>
-                  ) : (
-                    <input
-                      type={field.type || "text"}
-                      value={form[field.key]}
-                      onChange={(event) =>
-                        setForm({ ...form, [field.key]: field.type === "number" ? Number(event.target.value) : event.target.value })
-                      }
-                      required
-                    />
-                  )}
-                </label>
-              ))}
-              <label>
-                备注
-                <textarea value={note} onChange={(event) => setNote(event.target.value)} placeholder="填写处理说明或现场备注" />
-              </label>
-              <button type="submit">{project.primaryAction}</button>
-            </div>
-          </form>
+        <DndContext
+          sensors={sensors}
+          collisionDetection={closestCenter}
+          onDragStart={onDragStart}
+          onDragEnd={onDragEnd}
+          onDragCancel={() => setActiveId(null)}
+        >
+          <PendingPool orders={orders} onDelete={(id) => { store.removeOrder(id); message.success("订单已删除"); }} />
 
-          <section className="list-panel">
-            <div className="toolbar">
-              <h2>{project.entityLabel}列表</h2>
-              <select value={filter} onChange={(event) => setFilter(event.target.value)}>
-                {project.filters.map((item) => <option key={item}>{item}</option>)}
-              </select>
-            </div>
-
-            <div className="record-grid">
-              {filteredRecords.length === 0 ? <div className="empty">暂无匹配数据</div> : filteredRecords.map((record) => (
-                <article className="record" key={record.id}>
-                  <div className="record-head">
-                    <p className="record-title">{primaryText(record)}</p>
-                    <span className="status">{record.status}</span>
-                  </div>
-                  <div className="details">
-                    {fields.map((field) => (
-                      <span key={field.key}>{field.label}: {record[field.key]}</span>
-                    ))}
-                  </div>
-                  <p className="note">{record.notes}</p>
-                  <div className="actions">
-                    <button type="button" onClick={() => updateRecords(records.map((item) => item.id === record.id ? { ...item, status: nextStatus(item.status) } : item))}>
-                      流转状态
-                    </button>
-                    <button className="secondary" type="button" onClick={() => navigator.clipboard?.writeText(primaryText(record))}>
-                      复制摘要
-                    </button>
-                    <button className="danger" type="button" onClick={() => updateRecords(records.filter((item) => item.id !== record.id))}>
-                      删除
-                    </button>
-                  </div>
-                </article>
-              ))}
-            </div>
-
-            <div className="mini-chart">
-              {chartRows.map((row) => (
-                <div className="bar" key={row.status}>
-                  <span>{row.status}</span>
-                  <div className="bar-track"><div className="bar-fill" style={{ width: `${(row.value / maxChart) * 100}%` }} /></div>
-                  <strong>{row.value}</strong>
-                </div>
-              ))}
-            </div>
+          <section className="board">
+            {shifts.map((shift) => (
+              <ShiftColumn
+                key={shift.id}
+                shift={shift}
+                driver={drivers.find((d) => d.id === shift.driverId)}
+                orders={orders}
+                onRelease={(id) => { store.releaseOrder(id); message.success("已放行，计入本班容量"); }}
+                onReturn={(id) => { store.returnToPool(id); message.success("已退回待分配"); }}
+                onDepart={(id) => { store.depart(id); message.success("已发车，可交接给下一班"); }}
+                onHandover={(id) => { setHandoverOrderId(id); setPresetShiftId(undefined); }}
+              />
+            ))}
           </section>
+
+          <DragOverlay dropAnimation={null}>
+            {activeOrder ? <OrderCardView order={activeOrder} overlay /> : null}
+          </DragOverlay>
+        </DndContext>
+
+        <section className="side-grid">
+          <BlockPanel
+            blocks={blocks}
+            orders={orders}
+            onRelease={(id) => { store.releaseOrder(id); message.success("已放行，计入本班容量"); }}
+            onDismiss={(id) => store.resolveBlock(id)}
+          />
+          <HandoverLog handovers={handovers} />
         </section>
+
+        <footer className="foot-note">
+          数据自动保存在浏览器 localStorage，刷新或重开页面后排班、受阻与交接记录仍可续接。
+        </footer>
       </div>
+
+      <NewOrderModal
+        open={newOpen}
+        onClose={() => setNewOpen(false)}
+        onSubmit={(input) => { store.addOrder(input); message.success("已加入待分配"); }}
+      />
+      <HandoverModal
+        key={`${handoverOrderId ?? "none"}-${presetShiftId ?? "manual"}`}
+        order={handoverOrder}
+        shifts={shifts}
+        presetShiftId={presetShiftId}
+        driverName={driverName}
+        onClose={() => { setHandoverOrderId(null); setPresetShiftId(undefined); }}
+        onConfirm={confirmHandover}
+      />
     </main>
+  );
+}
+
+export default function App() {
+  return (
+    <AntdApp>
+      <Board />
+    </AntdApp>
   );
 }
